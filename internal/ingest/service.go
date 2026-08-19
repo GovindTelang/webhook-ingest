@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,6 +23,7 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+	wg    sync.WaitGroup
 }
 
 // New builds a Service.
@@ -32,6 +34,23 @@ func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *S
 // Stats returns the cached totals for an account.
 func (s *Service) Stats(accountID string) stats.AccountStats {
 	return s.cache.Get(accountID)
+}
+
+// Shutdown waits for background recording work to finish.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Ingest stores a delivery and kicks off processing. Processing runs
@@ -66,7 +85,11 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
+
 		go func() {
+			defer s.wg.Done()
+
 			workerCtx, cancel := context.WithTimeout(
 				context.Background(),
 				5*time.Second,
