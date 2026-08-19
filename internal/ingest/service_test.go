@@ -6,7 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
+	"sync"
+	
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -80,5 +81,103 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+func TestConcurrentDuplicateDeliveryIsIgnored(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const requests = 20
+
+	errCh := make(chan error, requests)
+
+	var wg sync.WaitGroup
+	wg.Add(requests)
+
+	for i := 0; i < requests; i++ {
+		go func() {
+			defer wg.Done()
+
+			resp, err := http.Post(
+				srv.URL+"/webhooks/calls",
+				"application/json",
+				strings.NewReader(body),
+			)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				errCh <- fmt.Errorf("got status %d, want 200", resp.StatusCode)
+				return
+			}
+
+			errCh <- nil
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var eventCount int
+	err := st.Pool().QueryRow(
+		ctx,
+		`SELECT count(*) FROM events WHERE event_id = $1`,
+		eventID,
+	).Scan(&eventCount)
+	if err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+
+	if eventCount != 1 {
+		t.Fatalf("stored %d copies of %s, want 1", eventCount, eventID)
+	}
+
+	var statsCount int64
+	var totalDuration int64
+
+	err = st.Pool().QueryRow(
+		ctx,
+		`SELECT call_count, total_duration_sec
+		 FROM account_stats
+		 WHERE account_id = $1`,
+		accountID,
+	).Scan(&statsCount, &totalDuration)
+	if err != nil {
+		t.Fatalf("read account stats: %v", err)
+	}
+
+	if statsCount != 1 {
+		t.Fatalf("got call_count=%d, want 1", statsCount)
+	}
+
+	if totalDuration != 143 {
+		t.Fatalf("got total_duration_sec=%d, want 143", totalDuration)
+	}
+
+	var callCount int
+	err = st.Pool().QueryRow(
+		ctx,
+		`SELECT count(*) FROM calls WHERE call_id = $1`,
+		callID,
+	).Scan(&callCount)
+	if err != nil {
+		t.Fatalf("count calls: %v", err)
+	}
+
+	if callCount != 1 {
+		t.Fatalf("stored %d call records, want 1", callCount)
 	}
 }
