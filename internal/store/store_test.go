@@ -86,3 +86,43 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+func TestProcessEventIgnoresDuplicate(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  10,
+		Payload:      []byte(`{}`),
+	}
+
+	inserted, err := s.ProcessEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("first ProcessEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("first ProcessEvent should insert the event")
+	}
+
+	inserted, err = s.ProcessEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("second ProcessEvent: %v", err)
+	}
+	if inserted {
+		t.Fatal("second ProcessEvent should be treated as a duplicate")
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+
+	if got.CallCount != 1 || got.TotalDurationSec != 10 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=10", got)
+	}
+}
